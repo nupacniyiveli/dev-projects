@@ -52,4 +52,4 @@ Create an inventory file ~/playbooks/inventory on jump host.
         state: started
         enabled: yes
 
-curl http://stapp03:8080/phpinfo.php
+curl http://node-ip:8080/phpinfo.php

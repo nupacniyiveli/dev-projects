@@ -1,0 +1,58 @@
+
+Note that the Universal Forwarder does not include bundled Python:
+If you need to run a Python script on a Universal Forwarder, you can install a local version of Python and run the script by using a .bat file. Otherwise you will need to use a full version of Splunk configured as a Lightweight Forwarder
+
+
+
+Run Python scripts with heavy forwarder to modify files on the server
+The goal of the script is to check the hostname in the input.conf file (in $ SPLUNK_HOME / etc / system / local) so that if the server hostname and the hostname in the input.conf file are different, the script change hostname in input.conf file and restart splunk.
+If the hostnames are the same, it does nothing and exits the script.
+
+The script must be run every night at 2:00 AM, and I would like once the app is created it will be distributed to all servers.
+
+
+
+import sys
+import fileinput
+import subprocess
+import re
+
+print("[+] Splunk Hostname Changer")
+
+
+def get_hostname_to_command():
+    hostC = subprocess.getoutput('hostname')
+    print("[+] Result to hostname command: " + hostC)
+    return hostC
+
+
+def get_hostname_to_file(path):
+    file = open(path,"r")
+    hostRow = file.readlines()[1]
+    hostF = re.search(r'[^host\s\=\s][A-Za-z]*[\-]*[A-Za-z]+',hostRow).group(0)
+    print("[+] Hostname in inputfile.conf: " + hostF)
+    return hostF
+
+
+def hostname_check(hostC,hostF,path):
+    if hostC != hostF:
+        print("[-] Hostname mismatch. Change the hostname in input.conf!")
+        for line in fileinput.input(path,inplace=True):
+            line = line.replace(hostF, hostC)
+            sys.stdout.write(line)
+        print("[+] Hostname changed. Operation Complete!")
+        print("[+] Restart Splunk...")
+        subprocess.call(["C:\Program Files\SplunkUniversalForwarder\\bin\splunk.exe","restart"])
+        print("[+] Restart Splunk completed!")
+    else:
+        print("[+] Hostname match. Exit to script!")
+
+
+hostCommand = get_hostname_to_command()
+hostFile = get_hostname_to_file("C:\Program Files\SplunkUniversalForwarder\etc\system\local\input.conf")
+hostname_check(hostCommand,hostFile, "C:\Program Files\SplunkUniversalForwarder\etc\system\local\input.conf")
+
+
+
+
+.

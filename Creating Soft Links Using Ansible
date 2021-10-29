@@ -1,0 +1,59 @@
+Write a playbook.yml under /home/dev/ansible directory on jump host, an inventory file is already present under /home/thor/ansible directory on jump host itself. Using this playbook accomplish below given tasks:
+
+Create an empty file /opt/itadmin/blog.txt on app server 1; its user owner and group owner should be tony. Create a symbolic link of source path /opt/itadmin to destination /var/www/html.
+
+Create an empty file /opt/itadmin/story.txt on app server 2; its user owner and group owner should be steve. Create a symbolic link of source path /opt/itadmin to destination /var/www/html.
+
+Create an empty file /opt/itadmin/media.txt on app server 3; its user owner and group owner should be banner. Create a symbolic link of source path /opt/itadmin to destination /var/www/html.
+
+Note: Validation will try to run the playbook using command ansible-playbook -i inventory playbook.yml so please make sure playbook works this way without passing any extra arguments.
+
+
+Solution
+------------------------
+
+
+vi playbook.yml
+--- 
+- 
+  become: true
+  hosts: "server1, server2, server3"
+  name: "Create text files and create soft link"
+  tasks: 
+    - 
+      file: 
+        group: tony
+        owner: tony
+        path: /opt/itadmin/blog.txt
+        state: touch
+      name: "Create the blog.txt on stapp01"
+      when: "inventory_hostname == \"stapp01\""
+    - 
+      file: 
+        group: steve
+        owner: steve
+        path: /opt/itadmin/story.txt
+        state: touch
+      name: "Create the story.txt on stapp02"
+      when: "inventory_hostname == \"stapp02\""
+    - 
+      file: 
+        group: banner
+        owner: banner
+        path: /opt/itadmin/media.txt
+        state: touch
+      name: "Create the media.txt on stapp03"
+      when: "inventory_hostname == \"stapp03\""
+    - 
+      file: 
+        dest: /var/www/html
+        src: /opt/itadmin/
+        state: link
+      name: "Link /opt/itadmin directory"
+
+ansible-playbook -i inventory playbook.yml -C to check syntax error and dry run
+
+ansible-playbook -i inventory playbook.yml
+
+ansible -i inventory all -a " ls -ltr /opt/itadmin"
+ansible -i inventory all -a  "ls -ltr /var/www/html"

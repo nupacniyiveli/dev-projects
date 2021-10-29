@@ -1,0 +1,84 @@
+
+=====================================================
+1- kubectl create namespace grafana-monitoring-datacenter
+-------------------------------------
+2 - sudo vi grafana-deployment-datacenter.yaml
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana-deployment-datacenter
+  namespace: grafana-monitoring-datacenter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      containers:
+        - name: grafana-container-datacenter
+          image: grafana/grafana:latest
+          ports:
+            - name: grafana
+              containerPort: 3000
+          resources:
+            limits:
+              memory: "2Gi"
+              cpu: "1000m"
+            requests:
+              memory: "1Gi"
+              cpu: "500m"
+          volumeMounts:
+            - name: grafana-storage
+              mountPath: /var/lib/grafana
+            
+       volumes:
+        - name: grafana-storage
+          emptyDir: {}
+--------------------------------------
+kubectl create -f grafana-deployment-datacenter.yaml
+---------------------------------
+Step : Create the service.
+
+#sudo vi grafana-service-datacenter.yaml
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana-service-datacenter
+  namespace: grafana-monitoring-datacenter
+  labels:
+    app: grafana
+spec:
+  selector:
+    app: grafana  
+  type: NodePort
+  ports:
+    - port: 3000    
+      targetPort: 3000   
+      nodePort: 32000    
+                         
+--------------------
+kubectl create -f  grafana-service-datacenter.yaml
+------------
+Testing or checking
+kubectl get deployment -n grafana-monitoring-datacenter
+kubectl get namespace -n grafana-monitoring-datacenter
+kubectl get pod -n grafana-monitoring-datacenter
+kubectl get service -n grafana-monitoring-datacenter
+kubectl describe service -n grafana-monitoring-datacenter
+
+------------------------
+3. Access Grafana Web Dashboard
+You can now open the Grafana dashboard in the browser using http://<master_IP>:NodePort. e.g:
+
+http://172.21.200.11:32000
+
+Now you should be able to access the Grafana dashboard using any node IP on port 32000. Use the following default username and password to log in. Once you log in with default credentials, it will prompt you to change the default password.
+
+User: admin
+Pass: admin
