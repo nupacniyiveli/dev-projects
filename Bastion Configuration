@@ -1,0 +1,281 @@
+# Bastion configuration
+How to Record SSH Sessions Established Through a Bastion Host
+by Niyi Adegoke | on 14 JUN 2016 | in Amazon VPC, How-To | Permalink |  Comments |  Share
+A bastion host is a server whose purpose is to provide access to a private network from an external network, such as the Internet. Because of its exposure to potential attack, a bastion host must minimize the chances of penetration. For example, you can use a bastion host to mitigate the risk of allowing SSH connections from an external network to the Linux instances launched in a private subnet of your Amazon Virtual Private Cloud (VPC).
+
+Recording SSH sessions enables auditing and can help in your efforts to comply with regulatory requirements.
+
+The solution architecture
+Amazon VPC enables you to launch AWS resources on a virtual private network that you have defined. The bastion host runs on an Amazon EC2 instance that is typically in a public subnet of your Amazon VPC. Linux instances are in a subnet that is not publicly accessible, and they are set up with a security group that allows SSH access from the security group attached to the underlying EC2 instance running the bastion host. Bastion host users connect to the bastion host to connect to the Linux instances, as illustrated in the following diagram.
+
+Diagram showing how bastion host users connect to the bastion host to connect to the Linux instances
+
+You can adapt this architecture to meet your own requirements. For example, you could have the bastion host in a separate Amazon VPC and a VPC peering connection between the two Amazon VPCs. What matters is that the bastion host remains the only source of SSH traffic to your Linux instances.
+
+This blog post’s solution for recording SSH sessions resides on the bastion host only and requires no specific configuration of Linux instances. You configure the solution by running commands at launch as the root user on an Amazon Linux instance.
+
+Note: It is a best practice to harden your bastion host because it is a critical point of network security. Hardening might include disabling unnecessary applications or services, tuning the network stack, and the like. I do not discuss hardening in detail in this blog post.
+
+When a client connects to an Amazon Linux instance, the default behavior of OpenSSH, the SSH server, is to run an interactive shell. Instead, I configure OpenSSH to execute a custom script that wraps an interactive shell into a script command. By doing so, the script command records everything displayed on the terminal, including keyboard input and full-screen applications such as vim. You can replay the session from the resulting log files by using the scriptreplay command. See the step-by-step example in the “Testing the solution” section later in this blog post.
+
+Note that I intentionally block a few SSH features because they would allow users to create a direct connection between their local computer and the Linux instances, thereby bypassing the solution.
+
+# Create a new folder for the log files
+mkdir /var/log/bastion
+
+# Allow ec2-user only to access this folder and its content
+chown ec2-user:ec2-user /var/log/bastion
+chmod -R 770 /var/log/bastion
+setfacl -Rdm other:0 /var/log/bastion
+
+# Make OpenSSH execute a custom script on logins
+echo -e "\nForceCommand /usr/bin/bastion/shell" >> /etc/ssh/sshd_config
+
+# Block some SSH features that bastion host users could use to circumvent 
+# the solution
+awk '!/AllowTcpForwarding/' /etc/ssh/sshd_config > temp && mv temp /etc/ssh/sshd_config
+awk '!/X11Forwarding/' /etc/ssh/sshd_config > temp && mv temp /etc/ssh/sshd_config
+echo "AllowTcpForwarding no" >> /etc/ssh/sshd_config
+echo "X11Forwarding no" >> /etc/ssh/sshd_config
+
+mkdir /usr/bin/bastion
+
+cat > /usr/bin/bastion/shell << 'EOF'
+
+# Check that the SSH client did not supply a command
+if [[ -z $SSH_ORIGINAL_COMMAND ]]; then
+
+  # The format of log files is /var/log/bastion/YYYY-MM-DD_HH-MM-SS_user
+  LOG_FILE="`date --date="today" "+%Y-%m-%d_%H-%M-%S"`_`whoami`"
+  LOG_DIR="/var/log/bastion/"
+
+  # Print a welcome message
+  echo ""
+  echo "NOTE: This SSH session will be recorded"
+  echo "AUDIT KEY: $LOG_FILE"
+  echo ""
+
+  # I suffix the log file name with a random string. I explain why 
+  # later on.
+  SUFFIX=`mktemp -u _XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX`
+
+  # Wrap an interactive shell into "script" to record the SSH session
+  script -qf --timing=$LOG_DIR$LOG_FILE$SUFFIX.time $LOG_DIR$LOG_FILE$SUFFIX.data --command=/bin/bash
+
+else
+
+  # The "script" program could be circumvented with some commands 
+  # (e.g. bash, nc). Therefore, I intentionally prevent users 
+  # from supplying commands.
+
+  echo "This bastion supports interactive sessions only. Do not supply a command"
+  exit 1
+
+fi
+
+EOF
+
+# Make the custom script executable
+chmod a+x /usr/bin/bastion/shell
+
+# Bastion host users could overwrite and tamper with an existing log file 
+# using "script" if they knew the exact file name. I take several measures 
+# to obfuscate the file name:
+# 1. Add a random suffix to the log file name.
+# 2. Prevent bastion host users from listing the folder containing log 
+# files. 
+# This is done by changing the group owner of "script" and setting GID.
+chown root:ec2-user /usr/bin/script
+chmod g+s /usr/bin/script
+
+# 3. Prevent bastion host users from viewing processes owned by other 
+# users, because the log file name is one of the "script" 
+# execution parameters.
+mount -o remount,rw,hidepid=2 /proc
+awk '!/proc/' /etc/fstab > temp && mv temp /etc/fstab
+echo "proc /proc proc defaults,hidepid=2 0 0" >> /etc/fstab
+
+# Restart the SSH service to apply /etc/ssh/sshd_config modifications.
+service sshd restart
+The preceding commands make OpenSSH execute a custom script on login, which records SSH sessions into log files stored in the folder,/var/log/bastion. For durable storage, the log files are copied at a regular interval to an Amazon S3 bucket, using theaws s3 cp command, which follows.
+
+cat > /usr/bin/bastion/sync_s3 << 'EOF'
+# Copy log files to S3 with server-side encryption enabled.
+# Then, if successful, delete log files that are older than a day.
+LOG_DIR="/var/log/bastion/"
+aws s3 cp $LOG_DIR s3://bucket-name/logs/ --sse --region region --recursive && find $LOG_DIR* -mtime +1 -exec rm {} \;
+
+EOF
+
+chmod 700 /usr/bin/bastion/sync_s3
+At this point, OpenSSH is configured to record SSH sessions and the log files are copied to Amazon S3. In order to determine the origin of any action performed on the Linux instances using SSH, bastion host users are provided with personal user accounts on the bastion host and they use their personal SSH key pair to log in. Each user account receives the minimum required privileges so that bastion host users are unable to disable or tamper with the solution.
+
+To ease the management of user accounts, the SSH public key of each bastion host user is uploaded to an S3 bucket. At a regular interval, the bastion host retrieves the public keys available in this bucket. For each public key, a user account is created if it does not already exist, and the SSH public key is copied to the bastion host to allow the user to log in with this key pair. For example, if the bastion host finds a file, john.pub, in the bucket, which is John’s SSH public key, it creates a user account, john, and the public key is copied to /home/john/.ssh/authorized_keys. If an SSH public key were to be removed from the S3 bucket, the bastion host would delete the related user account. Personal user account creations and deletions are logged in /var/log/bastion/users_changelog.txt.
+
+The following commands create a shell script for managing personal user accounts and scheduling a cron job to run the shell script every 5 minutes.
+
+# Bastion host users should log in to the bastion host with 
+# their personal SSH key pair. The public keys are stored on 
+# S3 with the following naming convention: "username.pub". This 
+# script retrieves the public keys, creates or deletes local user 
+# accounts as needed, and copies the public key to 
+# /home/username/.ssh/authorized_keys
+
+cat > /usr/bin/bastion/sync_users << 'EOF'
+
+# The file will log user changes
+LOG_FILE="/var/log/bastion/users_changelog.txt"
+
+# The function returns the user name from the public key file name.
+# Example: public-keys/sshuser.pub => sshuser
+get_user_name () {
+  echo "$1" | sed -e 's/.*\///g' | sed -e 's/\.pub//g'
+}
+
+# For each public key available in the S3 bucket
+aws s3api list-objects --bucket bucket-name --prefix public-keys/ --region region --output text --query 'Contents[?Size>`0`].Key' | sed -e 'y/\t/\n/' > ~/keys_retrieved_from_s3
+while read line; do
+  USER_NAME="`get_user_name "$line"`"
+
+  # Make sure the user name is alphanumeric
+  if [[ "$USER_NAME" =~ ^[a-z][-a-z0-9]*$ ]]; then
+
+    # Create a user account if it does not already exist
+    cut -d: -f1 /etc/passwd | grep -qx $USER_NAME
+    if [ $? -eq 1 ]; then
+      /usr/sbin/adduser $USER_NAME && \
+      mkdir -m 700 /home/$USER_NAME/.ssh && \
+      chown $USER_NAME:$USER_NAME /home/$USER_NAME/.ssh && \
+      echo "$line" >> ~/keys_installed && \
+      echo "`date --date="today" "+%Y-%m-%d %H-%M-%S"`: Creating user account for $USER_NAME ($line)" >> $LOG_FILE
+    fi
+
+    # Copy the public key from S3, if a user account was created 
+    # from this key
+    if [ -f ~/keys_installed ]; then
+      grep -qx "$line" ~/keys_installed
+      if [ $? -eq 0 ]; then
+        aws s3 cp s3://bucket-name/$line /home/$USER_NAME/.ssh/authorized_keys --region region
+        chmod 600 /home/$USER_NAME/.ssh/authorized_keys
+        chown $USER_NAME:$USER_NAME /home/$USER_NAME/.ssh/authorized_keys
+      fi
+    fi
+
+  fi
+done < ~/keys_retrieved_from_s3
+
+# Remove user accounts whose public key was deleted from S3
+if [ -f ~/keys_installed ]; then
+  sort -uo ~/keys_installed ~/keys_installed
+  sort -uo ~/keys_retrieved_from_s3 ~/keys_retrieved_from_s3
+  comm -13 ~/keys_retrieved_from_s3 ~/keys_installed | sed "s/\t//g" > ~/keys_to_remove
+  while read line; do
+    USER_NAME="`get_user_name "$line"`"
+    echo "`date --date="today" "+%Y-%m-%d %H-%M-%S"`: Removing user account for $USER_NAME ($line)" >> $LOG_FILE
+    /usr/sbin/userdel -r -f $USER_NAME
+  done < ~/keys_to_remove
+  comm -3 ~/keys_installed ~/keys_to_remove | sed "s/\t//g" > ~/tmp && mv ~/tmp ~/keys_installed
+fi
+
+EOF
+
+chmod 700 /usr/bin/bastion/sync_users
+
+cat > ~/mycron << EOF
+*/5 * * * * /usr/bin/bastion/sync_s3
+*/5 * * * * /usr/bin/bastion/sync_users
+0 0 * * * yum -y update --security
+EOF
+crontab ~/mycron
+rm ~/mycron
+Be very careful when distributing the key pair associated with the instance running the bastion host. With this key pair, someone could log in as the root or ec2-user user and damage or tamper with the solution. You might even consider launching the instance without a key pair if the operations requiring root access, such as patching, can be scripted and automated.
+
+Also, you should restrict the permissions on the S3 bucket by using bucket or IAM policies. For example, you could make the log files readable only by a compliance team and the SSH public keys managed by a DevOps team.
+
+Implementing the solution
+Now that you understand the architecture of this solution, you can follow the instructions in this section to implement in your AWS account this blog post’s solution.
+
+First, you will create two new key pairs. The first key pair will be associated with the instance running the bastion host. The second key pair will be associated with an Amazon Linux instance launched in a private subnet and will be used as the SSH key pair for a bastion host user.
+
+To manually create the two key pairs:
+
+Open the Amazon EC2 console and select a region from the navigation bar.
+Click Key Pairs in the left pane.
+Click Create Key Pair.
+In the Key pair name box, type bastion and click Create. Your browser downloads the private key file as bastion.pem.
+Repeat Steps 3 and 4 to create another key pair and name it sshuser.
+You then will use AWS CloudFormation to provision the required resources. Click Create a Stack to open the CloudFormation console and create a CloudFormation stack from the template. Click Next and enter bastion in BastionKeyPair and sshuser in InstanceKeyPair. Then, follow the on-screen instructions.
+
+CloudFormation creates the following resources:
+
+An Amazon VPC with an Internet gateway attached.
+A public subnet on this Amazon VPC with a new route table to make it publicly accessible.
+A private subnet on this Amazon VPC that will not have access to the Internet, for sake of simplicity.
+An S3 bucket. The log files will be stored in a folder called logs and the SSH public keys in a folder called public-keys.
+Two security groups. The first security group allows SSH traffic from the Internet, and the second security group allows SSH traffic from the first security group.
+An IAM role to grant an EC2 instance permissions to upload log files to the S3 bucket and to read SSH public keys.
+An Amazon Linux instance running the bastion host in the public subnet with the IAM role attached and the user data script entered to configure the solution.
+An Amazon Linux instance in the private subnet.
+After the stack creation has completed (it can take up to 10 minutes), click the Outputs tab in the CloudFormation console and note the values that the process returned: the name of the new S3 bucket, the public IP address of the bastion host, and the private IP address of the Linux instance.
+
+Finally, you will upload the SSH public key for the key pair sshuser to the S3 bucket so that the bastion host creates a new user account:
+
+Retrieve the public key and save it locally to a file named sshuser.pub (see Retrieving the Public Key for Your Key Pair on Linux or Retrieving the Public Key for Your Key Pair on Windows).
+Open the S3 console and click the name of the bucket in the buckets list.
+Create a new folder called public-keys (see Creating a Folder), and upload the SSH public key sshuser.pub to this folder (see Uploading Objects into Amazon S3).
+Wait for a few minutes. You should see a new folder called logs in the bucket with a new file inside it that is recording events related to user account creation and deletion.
+Testing the solution
+You might recall that the key pair sshuser serves to log in to both the bastion host as a bastion host user and the Linux instance in the private subnet as the privileged ec2-user user. Therefore, to test this solution, you will use SSH agent forwarding to connect from the bastion host to the Linux instance without storing the private key on the bastion host. See this blog post for further information about SSH agent forwarding.
+
+First, you will log in to the bastion host as sshuser with the -A argument to forward the SSH private key.
+
+chmod 600 [path to sshuser.pem]
+ssh-add [path to sshuser.pem]
+ssh -A sshuser@[public IP of the bastion host] –i [path to sshuser.pem]
+You should see a welcome message saying that the SSH session will be recorded, as shown in the following screenshot.
+
+Screenshot of welcome message that says the SSH session will be recorded
+
+Write down the value of the audit key. Then, connect to the Linux instance, run some commands of your choice, and then close the SSH session.
+
+ssh ec2-user@[private IP of the Linux instance]
+[commands of your choice that will be recorded]
+exit
+exit
+You will now replay the SSH session that was just recorded. Each session has two log files: one file contains the data displayed on the terminal, and the other contains the timing data that enables replay with realistic typing and output delays. For simplicity, you will connect as ec2-user to the bastion host and replay from the local copy of log files.
+
+Note: Under normal circumstances, you would not replay a SSH session on the bastion host, for two reasons. First, recall that you should strictly avoid using the privileged user account, ec2-user. Second, the bastion host does not have read permissions on the folder logs in the S3 bucket and the log files that are older than a day are deleted from the bastion host. Instead, you would use another Linux instance with sufficient permissions on the S3 bucket to download and replay the log files.
+
+ssh ec2-user@[public IP of the bastion host] –i [path to bastion.pem]
+export LOGFILE=`ls /var/log/bastion/[audit key]*.data | cut -d. -f1`
+scriptreplay --timing=$LOGFILE.time $LOGFILE.data
+You can now delete the CloudFormation stack to clean up the resources that were just created. Note that you need to empty the S3 bucket before it can be deleted by CloudFormation (see Empty a Bucket).
+
+Conclusion
+A bastion host is a standard element of network security that provides secure access to private networks over SSH. In this blog post, I have shown you a way to leverage this bastion host to record SSH sessions, which you can play back and use for auditing purposes.
+
+If you have comments, submit them in the “Comments” section below. If you have questions, please start a new thread on the Amazon VPC forum.
+
+
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout /etc/httpd/ssl/www.example.com.key -out /etc/httpd/ssl/www.example.com.crt
+
+SSLCertificateFile /etc/httpd/ssl/www.example.com.crt
+SSLCertificateKeyFile /etc/httpd/ssl/www.example.com.key
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

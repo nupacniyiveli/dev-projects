@@ -1,0 +1,68 @@
+Managing ACLs Using Ansible
+
+
+Create a playbook.yml under /home/dev/ansible on jump host, an inventory file is already present under /home/dev/ansible on Jump Server itself.
+
+Create an empty file blog.txt under /opt/finance/ directory on app server 1. Set some acl properties for this file. Using acl provide read '(r)' permissions to group tony (i.e entity is tony and etype is group).
+
+Create an empty file story.txt under /opt/finance/ directory on app server 2. Set some acl properties for this file. Using acl provide read + write '(rw)' permissions to user steve (i.e entity is steve and etype is user).
+
+Create an empty file media.txt under /opt/finance/ on app server 3. Set some acl properties for this file. Using acl provide read + write '(rw)' permissions to group banner (i.e entity is banner and etype is group).
+
+Note: Validation will try to run playbook using command ansible-playbook -i inventory playbook.yml so please make sure playbook works this way, without passing any extra arguments.
+
+
+Solution
+
+=============
+
+- hosts: all
+  become: yes
+  vars:
+    params:
+      stapp01:
+        filename: blog
+        entity: tony
+        etype: group
+        permissions: r
+        state: present
+      stapp02:
+        filename: story
+        entity: steve
+        etype: user
+        permissions: rw
+        state: present
+      stapp03:
+        filename: media
+        entity: banner
+        etype: group
+        permissions: rw
+        state: present
+  tasks:
+    - name: create empty file
+      file:
+        path: "/opt/dba/{{params[ansible_hostname]['filename']}}.txt"        
+        state: touch
+    - name: Configure ACLs
+      acl:
+        path: "/opt/dba/{{params[ansible_hostname]['filename']}}.txt"        
+        entity: "{{params[ansible_hostname]['entity']}}"  
+        etype: "{{params[ansible_hostname]['etype']}}" 
+        permissions: "{{params[ansible_hostname]['permissions']}}"
+        state: "{{params[ansible_hostname]['state']}}" 
+================================================
+run this command
+-----------------
+ansible-playbook -i inventory playbook.yml
+------------------------
+
+verify the Acl's
+-------------------
+sshpass -p <passwd> ssh -o "StrictHostKeyChecking no" <user@app1>
+sshpass -p <passwd> ssh -o "StrictHostKeyChecking no" <user@app2>
+sshpass -p <passwd> ssh -o "StrictHostKeyChecking no" <user@app3>
+
+sudo su
+cd /opt/finance
+ls -ltr
+check for the rw permssion
