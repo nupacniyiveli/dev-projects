@@ -1,0 +1,260 @@
+# Ansible : create roles and install prometheus, grafana and node-exporter
+
+inventory.yaml
+all:
+  monitor:
+    hosts:
+      172.17.0.2
+  others:
+    hosts:
+      172.17.0.5:
+      172.17.0.4:
+      172.17.0.3:
+monitor : for our monitoring stack (prometheus and grafana)
+others : for all other servers
+
+### create a role directory along the inventory file
+$ mkdir -p roles
+
+### run ansible-galaxy command to create the skeleton of a role
+$ ansible-galaxy init roles/node-exporter
+
+we can set some defaults variables in the default directory:
+
+node_exporter_version: "1.1.2"
+node_exporter_bin: /usr/local/bin/node_exporter
+node_exporter_user: node-exporter
+node_exporter_group: "{{ node_exporter_user }}"
+node_exporter_dir_conf: /etc/node_exporter
+
+### Also the main file of tasks directory :
+
+- name: check if node exporter exist
+  stat:
+    path: "{{ node_exporter_bin }}"
+  register: __check_node_exporter_present
+- name: create node exporter user
+  user:
+    name: "{{ node_exporter_user }}"
+    append: true
+    shell: /usr/sbin/nologin
+    system: true
+    create_home: false
+- name: create node exporter config dir
+  file:
+    path: "{{ node_exporter_dir_conf }}"
+    state: directory
+    owner: "{{ node_exporter_user }}"
+    group: "{{ node_exporter_group }}"
+- name: if node exporter exist get version
+  shell: "cat /etc/systemd/system/node_exporter.service | grep Version | sed s/'.*Version '//g"
+  when: __check_node_exporter_present.stat.exists == true
+  changed_when: false
+  register: __get_node_exporter_version
+  
+- name: download and unzip node exporter if not exist
+  unarchive:
+    src: "https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version }}/node_exporter-{{ node_exporter_version }}.linux-amd64.tar.gz"
+    dest: /tmp/
+    remote_src: yes
+    validate_certs: no
+- name: move the binary to the final destination
+  copy:
+    src: "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64/node_exporter"
+    dest: "{{ node_exporter_bin }}"
+    owner: "{{ node_exporter_user }}"
+    group: "{{ node_exporter_group }}"
+    mode: 0755
+    remote_src: yes
+  when: __check_node_exporter_present.stat.exists == false or not __get_node_exporter_version.stdout == node_exporter_version
+
+- name: clean
+  file:
+    path: /tmp/node_exporter-{{ node_exporter_version }}.linux-amd64/
+    state: absent
+- name: install service
+  template:
+    src: node_exporter.service.j2
+    dest: /etc/systemd/system/node_exporter.service
+    owner: root
+    group: root
+    mode: 0755
+  notify: reload_daemon_and_restart_node_exporter
+- meta: flush_handlers
+- name: service always started
+  systemd:
+    name: node_exporter
+    state: started
+    enabled: yes
+
+### then we create a node_exporter.service.j2 file in teplates directory :
+
+[Unit]
+Description=Node Exporter Version {{ node_exporter_version }}
+After=network-online.target
+[Service]
+User={{ node_exporter_user }}
+Group={{ node_exporter_user }}
+Type=simple
+ExecStart={{ node_exporter_bin }}
+[Install]
+WantedBy=multi-user.target
+
+### the handler file in the handler directory :
+- name: reload_daemon_and_restart_node_exporter
+  systemd:
+    name: node_exporter
+    state: restarted
+    daemon_reload: yes
+    enabled: yes
+
+### we can initialize a prometheus role :
+$ ansible-galaxy init roles/prometheus
+
+
+# Create the role for prometheus and its configuration
+Like node-exporter installation, write the default variables :
+
+prometheus_dir_configuration: "/etc/prometheus"
+prometheus_retention_time: "365d"
+prometheus_scrape_interval: "30s"
+prometheus_node_exporter: true
+prometheus_node_exporter_group: "all"
+prometheus_env: "production"
+prometheus_var_config:
+  global:
+    scrape_interval: "{{ prometheus_scrape_interval }}"
+    evaluation_interval: 5s
+    external_labels:
+      env: '{{ prometheus_env }}'
+  scrape_configs:
+    - job_name: prometheus
+      scrape_interval: 5m
+      static_configs:
+        - targets: ['{{ inventory_hostname }}:9090']
+
+we define a part of the prometheus configuration, the header exactly with prometheus_var_config.
+
+### create tasks in the main.yml file of tasks directory :
+- name: update and install prometheus
+  apt:
+    name: prometheus
+    state: latest
+    update_cache: yes
+    cache_valid_time: 3600
+- name: prometheus args
+  template:
+    src: prometheus.j2
+    dest: /etc/default/prometheus
+    mode: 0644
+    owner: root
+    group: root
+  notify: restart_prometheus
+- name: prometheus configuration file
+  template:
+    src: prometheus.yml.j2
+    dest: "{{ prometheus_dir_configuration }}/prometheus.yml"
+    mode: 0755
+    owner: prometheus
+    group: prometheus
+  notify: reload_prometheus
+- name: start prometheus
+  systemd:
+    name: prometheus
+    state: started
+    enabled: yes
+
+### create the prometheus.yaml.j2 file :
+
+#jinja2: lstrip_blocks: "True"
+{{ prometheus_var_config | to_nice_yaml(indent=2) }}
+{% if prometheus_node_exporter_group %}
+- job_name: node_exporter
+  scrape_interval: 15s
+  static_configs:
+  - targets:
+{% for server in groups[prometheus_node_exporter_group] %}
+    - {{ server }}:9100
+{% endfor %}
+{% endif %}
+
+### prometheus.j2 file for the prometheus CLI :
+
+ARGS="--web.enable-lifecycle --storage.tsdb.retention.time={{ prometheus_retention_time }} --web.console.templates=/etc/prometheus/consoles --web.console.libraries=/etc/prometheus/console_libraries
+
+### the handlers of this role :
+- name: restart_prometheus
+  systemd:
+    name: prometheus
+    state: restarted
+    enabled: yes
+    daemon_reload: yes
+- name: reload_prometheus
+  uri:
+    url: http://localhost:9090/-/reload
+    method: POST
+    status_code: 200
+
+We have two handlers :
+for a restart with the systemd service
+for the reload with a curl on the prometheus API.
+
+# Create a last role to install grafana-server package and start it.
+
+we can just edit the main.yml file in the tasks directory :
+- name: install gpg
+  apt:
+    name: gnupg,software-properties-common
+    state: present
+    update_cache: yes
+    cache_valid_time: 3600
+- name: add gpg hey
+  apt_key:
+    url: "https://packages.grafana.com/gpg.key"
+    validate_certs: no
+- name: add repository
+  apt_repository:
+    repo: "deb https://packages.grafana.com/oss/deb stable main"             
+    state: present
+    validate_certs: no
+- name: install grafana
+  apt:
+    name: grafana
+    state: latest
+    update_cache: yes
+    cache_valid_time: 3600
+- name: start service grafana-server
+  systemd:
+    name: grafana-server
+    state: started
+    enabled: yes
+- name: wait for service up
+  uri:
+    url: "http://127.0.0.1:3000"
+    status_code: 200
+  register: __result
+  until: __result.status == 200
+  retries: 120
+  delay: 1
+- name: change admin password for grafana gui
+  shell : "grafana-cli admin reset-admin-password {{ grafana_admin_password }}"
+  register: __command_admin
+  changed_when: __command_admin.rc !=0
+
+You can run this playbook file :
+- name: install monitoring stack
+  hosts: monitor
+  become: yes
+  roles:
+  - prometheus
+  - grafana
+- name: install node-exporter
+  hosts: all
+  become: yes
+  roles:
+  - node-exporter
+
+### with this ansible CLI :
+$ ansible-playbook -i inventory.yaml playbook.yml
+
+
